@@ -2,7 +2,7 @@ import express, { Request, Response, NextFunction } from 'express';
 import { config } from './config.js';
 import { logger } from './logger.js';
 import { authMiddleware } from './middleware.js';
-import { closeBrowser, publishNewsletter, checkSessionAlive } from './linkedin.js';
+import { closeBrowser, publishNewsletter } from './linkedin.js';
 import { sessionFileExists, sessionAgeHours, writeStorageState, normaliseToStorageState } from './session.js';
 import { notifySuccess, notifyFailure } from './webhook.js';
 import type { PublishRequest, HealthResponse, UpdateSessionRequest } from './types.js';
@@ -16,37 +16,24 @@ let publishInFlight = false;
 const app = express();
 app.use(express.json({ limit: '10mb' }));
 
-// ── Health check — unauthenticated, used by Fly.io + crons ────────────────────
+// ── Health check — unauthenticated, Railway liveness probe ───────────────────
+// IMPORTANT: never launch the browser here. This endpoint must return 200
+// instantly so Railway's healthcheck passes regardless of session state.
+// Session validity is checked implicitly on the first publish request.
 
-app.get('/health', async (_req: Request, res: Response) => {
+app.get('/health', (_req: Request, res: Response) => {
   const fileExists = sessionFileExists();
-  const ageHours = sessionAgeHours();
-  let sessionAlive = false;
-  let message: string | undefined;
-
-  if (!fileExists) {
-    message = 'Session file not found — POST /admin/update-session to initialise';
-  } else {
-    try {
-      sessionAlive = await checkSessionAlive();
-      if (!sessionAlive) {
-        message = 'LinkedIn session expired — POST /admin/update-session with fresh cookies';
-      }
-    } catch (err) {
-      message = `Health check failed: ${err instanceof Error ? err.message : String(err)}`;
-    }
-  }
-
   const body: HealthResponse = {
-    status: sessionAlive ? 'ok' : 'degraded',
-    session_alive: sessionAlive,
+    status: 'ok',
+    session_alive: false, // not checked here — requires browser
     session_file_exists: fileExists,
-    session_age_hours: fileExists ? Math.round(ageHours * 10) / 10 : undefined,
+    session_age_hours: fileExists ? Math.round(sessionAgeHours() * 10) / 10 : undefined,
     last_checked: new Date().toISOString(),
-    message,
+    message: fileExists
+      ? undefined
+      : 'Session file not found — POST /admin/update-session to initialise',
   };
-
-  res.status(sessionAlive ? 200 : 503).json(body);
+  res.status(200).json(body); // always 200 — this is a liveness check, not a session check
 });
 
 // ── Publish newsletter — authenticated ────────────────────────────────────────
