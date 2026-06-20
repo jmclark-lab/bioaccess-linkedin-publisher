@@ -353,9 +353,9 @@ export async function publishNewsletter(req: PublishRequest): Promise<PublishRes
     // Wait for navigation to the published article
     await page.waitForURL(
       (url) =>
-        url.includes('/pulse/') &&
-        !url.includes('/new') &&
-        !url.includes('/article/new'),
+        url.href.includes('/pulse/') &&
+        !url.href.includes('/new') &&
+        !url.href.includes('/article/new'),
       { timeout: config.navTimeoutMs },
     );
 
