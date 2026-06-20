@@ -1,0 +1,16 @@
+# railway.toml — bioaccess LinkedIn Newsletter Publisher
+# Docs: https://docs.railway.app/reference/config-as-code
+
+[build]
+  builder = "dockerfile"
+  dockerfilePath = "Dockerfile"
+
+[deploy]
+  startCommand = "node dist/index.js"
+  healthcheckPath = "/health"
+  healthcheckTimeout = 30
+  restartPolicyType = "on_failure"
+  restartPolicyMaxRetries = 3
+
+# VOLUMES — create in Railway dashboard → Service → Volumes tab
+# Volume name: linkedin-session | Mount path: /data

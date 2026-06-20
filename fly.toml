@@ -1,0 +1,58 @@
+# fly.toml — bioaccess LinkedIn Newsletter Publisher
+# Deploy: fly deploy (from this directory)
+# Docs:   https://fly.io/docs/reference/configuration/
+
+app = "bioaccess-linkedin-publisher"
+primary_region = "ewr"  # Newark — closest to ET (where the crons fire)
+
+[build]
+  # No builder needed; we use the Dockerfile
+
+[env]
+  NODE_ENV        = "production"
+  PORT            = "3000"
+  SESSION_FILE    = "/data/session.json"
+  LOG_LEVEL       = "info"
+  PLAYWRIGHT_HEADLESS = "true"
+
+# Secrets (set once via `fly secrets set`, never committed):
+#   BIOACCESS_TOKEN         — shared token for x-bioaccess-token
+#   SUPABASE_WEBHOOK_TOKEN  — Supabase anon/service key
+#   SUPABASE_WEBHOOK_URL    — edge function URL (optional override)
+
+[[mounts]]
+  # Persistent volume stores the LinkedIn session cookies across deploys.
+  # Create with: fly volumes create linkedin_session --region ewr --size 1
+  source      = "linkedin_session"
+  destination = "/data"
+  initial_size = "1gb"
+
+[http_service]
+  internal_port       = 3000
+  force_https         = true
+
+  # Scale to zero between cron calls — saves money, adds ~5–8 s cold start.
+  # Set min_machines_running = 1 if you need instant response.
+  auto_stop_machines  = true
+  auto_start_machines = true
+  min_machines_running = 0
+
+  # Fly.io health check — must return 2xx for traffic to route.
+  # We return 503 when session is expired (still "healthy" process-wise).
+  [[http_service.checks]]
+    grace_period = "30s"
+    interval     = "60s"
+    method       = "GET"
+    path         = "/health"
+    timeout      = "15s"
+    # Allow 503 (session expired) without marking the machine unhealthy
+    # Note: Fly treats any 2xx/3xx as healthy; 503 will fail the check.
+    # To avoid false-positive unhealthy alerts when session expires,
+    # the /health endpoint returns 503 only for session issues — this is
+    # intentional so you get alerted. Fix by re-importing cookies.
+
+[[vm]]
+  # Playwright/Chromium needs at least 512 MB; 1 GB is comfortable.
+  memory   = "1gb"
+  cpu_kind = "shared"
+  cpus     = 1
