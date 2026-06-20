@@ -267,9 +267,9 @@ export async function publishNewsletter(req: PublishRequest): Promise<PublishRes
     // LinkedIn article editor lands at /pulse/article/new or /pulse/new-article
     await page.waitForURL(
       (url) =>
-        url.includes('/pulse/article/new') ||
-        url.includes('/pulse/new-article') ||
-        url.includes('/article/new'),
+        url.href.includes('/pulse/article/new') ||
+        url.href.includes('/pulse/new-article') ||
+        url.href.includes('/article/new'),
       { timeout: config.navTimeoutMs },
     );
     logger.info('Article editor opened', { url: page.url() });
