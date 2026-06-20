@@ -2,7 +2,7 @@ import express, { Request, Response, NextFunction } from 'express';
 import { config } from './config.js';
 import { logger } from './logger.js';
 import { authMiddleware } from './middleware.js';
-import { initBrowser, closeBrowser, publishNewsletter, checkSessionAlive } from './linkedin.js';
+import { closeBrowser, publishNewsletter, checkSessionAlive } from './linkedin.js';
 import { sessionFileExists, sessionAgeHours, writeStorageState, normaliseToStorageState } from './session.js';
 import { notifySuccess, notifyFailure } from './webhook.js';
 import type { PublishRequest, HealthResponse, UpdateSessionRequest } from './types.js';
@@ -179,7 +179,9 @@ app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
 // ── Startup ────────────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
-  await initBrowser();
+  // Browser is launched lazily on first publish request — do not init here.
+  // Eager init caused crash-loops on Railway because Chromium failed to start
+  // before the healthcheck endpoint was ready.
 
   app.listen(config.port, () => {
     logger.info(`bioaccess LinkedIn Publisher listening on :${config.port}`);
