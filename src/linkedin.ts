@@ -325,144 +325,122 @@ export async function publishNewsletter(req: PublishRequest): Promise<PublishRes
     await humanDelay(1000);
     await saveDebugScreenshot(page, `04-body-filled-${req.newsletter}`);
 
-    // ── Step 6: Click "Next" ──────────────────────────────────────────────────
-    logger.info('Clicking Next');
-    const nextButton = page
-      .locator('button:has-text("Next"), [aria-label="Next"]')
-      .first();
-    await nextButton.waitFor({ state: 'visible', timeout: config.stepTimeoutMs });
-    await nextButton.click();
-    await humanDelay(2500);
-    await saveDebugScreenshot(page, `05-next-clicked-${req.newsletter}`);
+    // ── Steps 6–8: Next → Edit → Publish → Live URL ──────────────────────────
+    //
+    // LinkedIn's article editor has a multi-step publish flow:
+    //   1. Fill content (editor at /article/new/)
+    //   2. Click "Next" → LinkedIn auto-saves and navigates to /article/edit/<ID>/
+    //   3. At the edit page, click "Publish"
+    //   4. Navigate to published article at /pulse/<slug>/
+    //
+    // We loop through publish attempts, clicking any visible Publish-like button
+    // until we reach a /pulse/ URL (the live article) or exhaust attempts.
 
-    // ── Step 7: Handle multi-step Next + click "Publish" ─────────────────────
-    // LinkedIn's article editor sometimes has a 2-step Next flow (editor → settings
-    // panel → publish confirmation). We check for a second "Next" first, then look
-    // for the Publish/Post button using both Playwright and JS visibility checks.
-    // Also covers renamed buttons: "Publish", "Post", "Publish article", etc.
-    logger.info('Checking for second Next or Publish button');
-    await saveDebugScreenshot(page, `06-before-publish-${req.newsletter}`);
+    const PUBLISH_CLICK_TEXTS = ['Publish', 'Publish article', 'Publish now', 'Post', 'Post article'];
+    const PUBLISH_CLICK_SEL = PUBLISH_CLICK_TEXTS.map((t) => `button:has-text("${t}")`).join(', ');
 
-    const NEXT_SEL = 'button:has-text("Next"), [aria-label="Next"]';
-    const secondNextVisible = await page
-      .locator(NEXT_SEL)
-      .first()
-      .isVisible({ timeout: 3000 })
-      .catch(() => false);
-    if (secondNextVisible) {
-      logger.info('Clicking second Next (multi-step flow)');
-      await page.locator(NEXT_SEL).first().click();
-      await humanDelay(2000);
-      await saveDebugScreenshot(page, `06b-second-next-${req.newsletter}`);
-    }
-
-    // Try Playwright locator first (covers text variants LinkedIn might use)
-    const PUBLISH_SEL = [
-      'button:has-text("Publish")',
-      'button:has-text("Publish article")',
-      'button:has-text("Publish now")',
-      'button:has-text("Post")',
-      'button:has-text("Post article")',
-      '[aria-label="Publish"]',
-      '[aria-label="Post"]',
-    ].join(', ');
-
-    const publishButton = page.locator(PUBLISH_SEL).first();
-    const publishVisible = await publishButton
-      .isVisible({ timeout: config.stepTimeoutMs })
-      .catch(() => false);
-
-    if (publishVisible) {
-      logger.info('Clicking Publish button via Playwright');
-      await publishButton.click();
-    } else {
-      // JS fallback: find a visible button with any publish-like text
-      logger.info('Publish button not found via Playwright — trying JS fallback');
-      await saveDebugScreenshot(page, `07-publish-not-found-${req.newsletter}`);
-      const publishTexts = ['Publish', 'Publish article', 'Publish now', 'Post', 'Post article'];
-      const jsClicked = await page.evaluate((texts: string[]): string | null => {
-        const isVisible = (el: Element): boolean => {
+    // Helper: click the first visible Publish-like button (Playwright then JS fallback)
+    const clickPublishButton = async (step: string): Promise<boolean> => {
+      const btn = page.locator(PUBLISH_CLICK_SEL).first();
+      const visible = await btn.isVisible({ timeout: 5000 }).catch(() => false);
+      if (visible) {
+        logger.info('Clicking Publish button', { step, method: 'playwright' });
+        await btn.click();
+        return true;
+      }
+      // JS fallback: find a visible button with matching text via getBoundingClientRect()
+      const jsClicked = await page.evaluate((texts: string[]): boolean => {
+        const isVis = (el: Element): boolean => {
           const rect = el.getBoundingClientRect();
-          return rect.width > 20 && rect.height > 5 &&
-                 rect.top >= 0 && rect.top < window.innerHeight;
+          return rect.width > 20 && rect.height > 5 && rect.top >= 0 && rect.top < window.innerHeight;
         };
         const buttons = Array.from(document.querySelectorAll('button')) as HTMLButtonElement[];
         for (const text of texts) {
-          const btn = buttons.find(
-            (b) => b.textContent?.trim().toLowerCase() === text.toLowerCase() && isVisible(b),
+          const b = buttons.find(
+            (b) => b.textContent?.trim().toLowerCase() === text.toLowerCase() && isVis(b),
           );
-          if (btn) { btn.click(); return text; }
+          if (b) { b.click(); return true; }
         }
-        return null;
-      }, publishTexts);
-      if (!jsClicked) {
-        throw new Error(
-          'Could not find Publish button after clicking Next. ' +
-            'Check debug screenshots for the page state at this step.',
-        );
+        return false;
+      }, PUBLISH_CLICK_TEXTS);
+      if (jsClicked) {
+        logger.info('Clicking Publish button', { step, method: 'js' });
       }
-      logger.info('Publish button clicked via JS', { buttonText: jsClicked });
-    }
+      return jsClicked;
+    };
 
-    // Brief wait + screenshot to diagnose what happens after clicking Publish
+    // ── Step 6: Click "Next" ────────────────────────────────────────────────
+    logger.info('Clicking Next');
+    const nextButton = page.locator('button:has-text("Next"), [aria-label="Next"]').first();
+    await nextButton.waitFor({ state: 'visible', timeout: config.stepTimeoutMs });
+    await nextButton.click();
     await humanDelay(2500);
-    await saveDebugScreenshot(page, `07-after-publish-click-${req.newsletter}`);
+    await saveDebugScreenshot(page, `05-after-next-${req.newsletter}`);
+    logger.info('After Next, URL is', { url: page.url() });
 
-    // LinkedIn sometimes shows a confirmation dialog/step after the first Publish click
-    // (e.g. an additional review pane with a second "Publish" or "Publish now" button).
-    const FINAL_CONF_SEL = [
-      'button:has-text("Publish")',
-      'button:has-text("Publish article")',
-      'button:has-text("Publish now")',
-      'button:has-text("Post")',
-      '[aria-label="Publish now"]',
-    ].join(', ');
-    const finalConfirmVisible = await page
-      .locator(FINAL_CONF_SEL)
-      .first()
-      .isVisible({ timeout: 3000 })
-      .catch(() => false);
-    if (finalConfirmVisible) {
-      logger.info('Clicking final confirmation Publish button');
-      await page.locator(FINAL_CONF_SEL).first().click();
-      await humanDelay(2000);
-      await saveDebugScreenshot(page, `07b-final-confirm-clicked-${req.newsletter}`);
+    // ── Steps 7–8: Publish loop ─────────────────────────────────────────────
+    // Iterate up to 4 times. Each iteration:
+    //   - Screenshot the current state
+    //   - If we're already at a /pulse/ URL, we're done
+    //   - Otherwise click Publish and wait for the URL to change
+    let articleUrl: string | undefined;
+
+    for (let attempt = 0; attempt < 4; attempt++) {
+      await saveDebugScreenshot(page, `0${6 + attempt}-publish-loop-${attempt}-${req.newsletter}`);
+      const curUrl = page.url();
+      logger.info('Publish loop iteration', { attempt, url: curUrl });
+
+      // ── Check if already at published URL ──
+      if (curUrl.includes('/pulse/') && !curUrl.includes('/edit')) {
+        articleUrl = curUrl;
+        logger.info('Reached published article URL', { articleUrl });
+        break;
+      }
+
+      // ── Click Publish ──
+      const clicked = await clickPublishButton(`attempt-${attempt}`);
+      if (!clicked) {
+        logger.warn('No Publish button found', { attempt, url: curUrl });
+        // Take screenshot and bail — we can't proceed without the button
+        await saveDebugScreenshot(page, `publish-no-btn-${attempt}-${req.newsletter}`);
+        break;
+      }
+
+      // ── Wait up to 5s for the URL to change to a /pulse/ URL ──
+      try {
+        await page.waitForURL(
+          (url) => url.href.includes('/pulse/') && !url.href.includes('/edit'),
+          { timeout: 10_000 },
+        );
+        articleUrl = page.url();
+        logger.info('Reached published article URL via waitForURL', { articleUrl });
+        break;
+      } catch {
+        // URL didn't change to /pulse/ yet — wait a beat and try next iteration
+        await humanDelay(2000);
+      }
     }
 
-    // Wait for navigation away from the article editor.
-    // Published newsletter articles land at /pulse/ but we also accept any non-editor URL
-    // in case LinkedIn redirects elsewhere (newsletter page, feed, etc.).
-    let articleUrl: string;
-    try {
-      await page.waitForURL(
-        (url) => !url.href.includes('/article/new'),
-        { timeout: config.navTimeoutMs },
-      );
-      articleUrl = page.url();
-      logger.info('Navigated to post-publish URL', { articleUrl });
-    } catch {
-      // Navigation timed out — article may still have published. Check page for article link.
-      await saveDebugScreenshot(page, `08-nav-timeout-${req.newsletter}`);
-      const linkHref = await page.evaluate((): string | null => {
-        const selectors = ['a[href*="/pulse/"]', 'a[href*="/article/"]'];
-        for (const sel of selectors) {
-          const links = Array.from(document.querySelectorAll(sel));
-          for (const link of links) {
-            const href = link.getAttribute('href') ?? '';
-            if (!href.includes('/new') && !href.includes('/article/new')) return href;
-          }
+    if (!articleUrl) {
+      // Last-ditch: check if page has a /pulse/ link (success page with "View article")
+      await saveDebugScreenshot(page, `publish-loop-end-${req.newsletter}`);
+      const pulseLink = await page.evaluate((): string | null => {
+        const links = Array.from(document.querySelectorAll('a[href*="/pulse/"]'));
+        for (const a of links) {
+          const href = a.getAttribute('href') ?? '';
+          if (!href.includes('/edit') && !href.includes('/new')) return href;
         }
         return null;
       });
-      if (linkHref) {
-        articleUrl = linkHref.startsWith('http')
-          ? linkHref
-          : `https://www.linkedin.com${linkHref}`;
-        logger.info('Article URL found on page (no navigation occurred)', { articleUrl });
+      if (pulseLink) {
+        articleUrl = pulseLink.startsWith('http')
+          ? pulseLink
+          : `https://www.linkedin.com${pulseLink}`;
+        logger.info('Article URL found via page link scan', { articleUrl });
       } else {
         throw new Error(
-          'Publish was clicked but no navigation occurred and no article URL was found on the page. ' +
-            'Check debug screenshots (07-after-publish-click, 08-nav-timeout).',
+          `Publish loop exited without reaching a published article URL. Last URL: ${page.url()}. ` +
+            'Check debug screenshots (publish-loop-*).',
         );
       }
     }
