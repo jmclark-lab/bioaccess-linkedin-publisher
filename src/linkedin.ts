@@ -6,8 +6,10 @@
  *
  * ── Flow ──────────────────────────────────────────────────────────────────────
  * 1. Load persistent session cookies from disk.
- * 2. Navigate to the newsletter index page (e.g. /newsletters/global-trial-accelerators).
- * 3. Click the "Write article" button that LinkedIn renders for newsletter admins.
+ * 2. Navigate to https://www.linkedin.com/article/new/
+ * 3. Open the "Publish as / Publish to" dropdown at the top of the editor.
+ *    a. Under "Publish as": select "Julio G. Martinez-Clark" (personal profile).
+ *    b. Under "Publish to": select the target newsletter by display name.
  * 4. In the article editor:
  *    a. Upload cover image (if provided — downloaded from URL, temp file).
  *    b. Fill in the title.
@@ -15,6 +17,13 @@
  * 5. Click "Next" then "Publish".
  * 6. Capture and return the published article URL.
  * 7. Save updated cookies back to disk.
+ *
+ * ── Why /article/new/ instead of newsletter index page ────────────────────────
+ * The previous flow navigated to the newsletter index page and clicked "Write article".
+ * For GTA, the index URL (https://www.linkedin.com/newsletters/global-trial-accelerators)
+ * has no numeric ID suffix and returns "Something went wrong". The /article/new/ approach
+ * uses the LinkedIn article editor directly and presents a newsletter picker dropdown
+ * that works reliably for all newsletters the account manages.
  *
  * ── Selector strategy ─────────────────────────────────────────────────────────
  * LinkedIn uses dynamic class names. We prefer:
@@ -37,7 +46,7 @@ import { marked } from 'marked';
 import { config } from './config.js';
 import { logger } from './logger.js';
 import { sessionFileExists, readStorageState } from './session.js';
-import type { PublishRequest, PublishResponse, NewsletterKey } from './types.js';
+import type { PublishRequest, PublishResponse } from './types.js';
 import { NEWSLETTERS } from './types.js';
 
 // ── Singleton browser instance ─────────────────────────────────────────────────
@@ -226,9 +235,12 @@ export async function publishNewsletter(req: PublishRequest): Promise<PublishRes
   page.setDefaultNavigationTimeout(config.navTimeoutMs);
 
   try {
-    // ── Step 1: Navigate to the newsletter index page ─────────────────────────
-    logger.info('Navigating to newsletter page', { url: newsletter.indexUrl });
-    await page.goto(newsletter.indexUrl, { waitUntil: 'domcontentloaded' });
+    // ── Step 1: Navigate to the article editor ────────────────────────────────
+    // We go directly to /article/new/ rather than the newsletter index page.
+    // The newsletter index approach is broken for GTA (URL has no numeric ID).
+    // The editor's author/newsletter dropdown lets us select any newsletter.
+    logger.info('Navigating to article editor');
+    await page.goto('https://www.linkedin.com/article/new/', { waitUntil: 'domcontentloaded' });
 
     // Check for auth wall
     const currentUrl = page.url();
@@ -241,53 +253,21 @@ export async function publishNewsletter(req: PublishRequest): Promise<PublishRes
     }
 
     await humanDelay(2000);
+    await saveDebugScreenshot(page, `01-editor-opened-${req.newsletter}`);
 
-    // ── Step 2: Click the "Write article" / "Create episode" button ───────────
-    logger.info('Looking for Write Article button');
-    await saveDebugScreenshot(page, `01-newsletter-page-${req.newsletter}`);
+    // ── Step 2: Select "Julio G. Martinez-Clark" (Publish as) + newsletter ────
+    // The editor shows a dropdown at the top-left with "Publish as" and "Publish to"
+    // sections. We must select Julio's personal profile and the target newsletter.
+    await selectAuthorAndNewsletter(page, newsletter.displayName);
+    await saveDebugScreenshot(page, `02-newsletter-selected-${req.newsletter}`);
 
-    // LinkedIn shows a "Write article" or "Create episode" button for newsletter admins
-    const writeButton = page
-      .locator([
-        'button:has-text("Write article")',
-        'a:has-text("Write article")',
-        'button:has-text("Create episode")',
-        'a:has-text("Create episode")',
-        'button:has-text("Write a newsletter")',
-        '[aria-label*="Write article" i]',
-      ].join(', '))
-      .first();
-
-    await writeButton.waitFor({ state: 'visible', timeout: config.stepTimeoutMs });
-    await writeButton.click();
-    logger.info('Clicked Write Article button');
-    await humanDelay(3000);
-
-    // ── Step 3: Wait for article editor to open ───────────────────────────────
-    // LinkedIn article editor lands at /pulse/article/new or /pulse/new-article
-    await page.waitForURL(
-      (url) =>
-        url.href.includes('/pulse/article/new') ||
-        url.href.includes('/pulse/new-article') ||
-        url.href.includes('/article/new'),
-      { timeout: config.navTimeoutMs },
-    );
-    logger.info('Article editor opened', { url: page.url() });
-    await humanDelay(2000);
-    await saveDebugScreenshot(page, `02-editor-open-${req.newsletter}`);
-
-    // ── Step 4: Select the newsletter (if a picker appears) ──────────────────
-    // When the editor opens from the newsletter page, LinkedIn may auto-associate
-    // the newsletter. If a "Select newsletter" prompt appears, pick the right one.
-    await selectNewsletter(page, req.newsletter, newsletter.displayName);
-
-    // ── Step 5: Upload cover image ────────────────────────────────────────────
+    // ── Step 3: Upload cover image ────────────────────────────────────────────
     if (req.cover_image_url) {
       await uploadCoverImage(page, req.cover_image_url);
       await saveDebugScreenshot(page, `03-cover-uploaded-${req.newsletter}`);
     }
 
-    // ── Step 6: Fill in title ─────────────────────────────────────────────────
+    // ── Step 4: Fill in title ─────────────────────────────────────────────────
     logger.info('Filling title');
     const titleField = page
       .locator(
@@ -300,7 +280,7 @@ export async function publishNewsletter(req: PublishRequest): Promise<PublishRes
     await page.keyboard.type(req.title, { delay: 30 });
     await humanDelay(800);
 
-    // ── Step 7: Fill in body ──────────────────────────────────────────────────
+    // ── Step 5: Fill in body ──────────────────────────────────────────────────
     logger.info('Filling body');
     const bodyHtml = await markdownToHtml(req.body_markdown);
 
@@ -332,7 +312,7 @@ export async function publishNewsletter(req: PublishRequest): Promise<PublishRes
     await humanDelay(1000);
     await saveDebugScreenshot(page, `04-body-filled-${req.newsletter}`);
 
-    // ── Step 8: Click "Next" ──────────────────────────────────────────────────
+    // ── Step 6: Click "Next" ──────────────────────────────────────────────────
     logger.info('Clicking Next');
     const nextButton = page
       .locator('button:has-text("Next"), [aria-label="Next"]')
@@ -342,7 +322,7 @@ export async function publishNewsletter(req: PublishRequest): Promise<PublishRes
     await humanDelay(2000);
     await saveDebugScreenshot(page, `05-next-clicked-${req.newsletter}`);
 
-    // ── Step 9: Click "Publish" ───────────────────────────────────────────────
+    // ── Step 7: Click "Publish" ───────────────────────────────────────────────
     logger.info('Clicking Publish');
     const publishButton = page
       .locator('button:has-text("Publish"), [aria-label="Publish"]')
@@ -363,7 +343,7 @@ export async function publishNewsletter(req: PublishRequest): Promise<PublishRes
     logger.info('Article published successfully', { articleUrl });
     await saveDebugScreenshot(page, `06-published-${req.newsletter}`);
 
-    // ── Step 10: Save updated session cookies ─────────────────────────────────
+    // ── Step 8: Save updated session cookies ──────────────────────────────────
     await context.storageState({ path: config.sessionFile });
     logger.info('Session cookies refreshed');
 
@@ -384,52 +364,132 @@ export async function publishNewsletter(req: PublishRequest): Promise<PublishRes
   }
 }
 
-// ── Newsletter selector helper ────────────────────────────────────────────────
+// ── Author + newsletter picker helper ─────────────────────────────────────────
 
 /**
- * After the article editor opens, LinkedIn may show a newsletter picker
- * (a modal or dropdown) when multiple newsletters exist. This function
- * handles that case.
+ * Opens the "Publish as / Publish to" dropdown at the top of the article editor
+ * and selects:
+ *   - "Publish as": Julio G. Martinez-Clark (personal profile)
+ *   - "Publish to": the target newsletter by display name
  *
- * If the editor was opened from the newsletter index page, LinkedIn typically
- * auto-selects that newsletter and skips the picker — so this is a no-op.
+ * The dropdown is a panel with two sections:
+ *   "Publish as" — list of author profiles (personal + company pages)
+ *   "Publish to" — "Individual article" or a newsletter
+ *
+ * Confirmed via browser investigation on 2026-06-21: the dropdown trigger is a
+ * button in the editor header containing a profile photo and the current
+ * author/newsletter name. After selecting Julio under "Publish as", the URL
+ * updates to ?author=urn:li:fsd_profile:... and the "Publish to" list shows
+ * "Individual article", "LATAM Regulatory Dispatch™", and "Global Trial Accelerators™".
  */
-async function selectNewsletter(
+async function selectAuthorAndNewsletter(
   page: Page,
-  key: NewsletterKey,
-  displayName: string,
+  newsletterDisplayName: string,
 ): Promise<void> {
-  // Give the editor 3 seconds to show a picker if one exists
-  await humanDelay(3000);
+  const AUTHOR_NAME = 'Julio G. Martinez-Clark';
 
-  // Look for a modal or dropdown that lists newsletters
-  const pickerVisible = await page
-    .locator('[aria-label*="newsletter" i], [data-test*="newsletter"], .newsletter-picker')
-    .first()
-    .isVisible({ timeout: 3_000 })
-    .catch(() => false);
+  // ── Open the dropdown ──────────────────────────────────────────────────────
+  logger.info('Opening author/newsletter dropdown');
+  let dropdownOpened = false;
 
-  if (!pickerVisible) {
-    logger.info('No newsletter picker appeared — newsletter auto-selected');
-    return;
+  // Try Playwright locators first (most stable)
+  const triggerSelectors = [
+    'button[aria-haspopup="listbox"]',
+    'button[aria-haspopup="true"]',
+    '[role="button"][aria-haspopup]',
+    '.artdeco-dropdown__trigger',
+  ];
+
+  for (const sel of triggerSelectors) {
+    const el = page.locator(sel).first();
+    if (await el.isVisible({ timeout: 2000 }).catch(() => false)) {
+      await el.click();
+      await humanDelay(800);
+      const hasPublishAs = await page
+        .getByText('Publish as', { exact: false })
+        .isVisible({ timeout: 3000 })
+        .catch(() => false);
+      if (hasPublishAs) {
+        dropdownOpened = true;
+        logger.info('Dropdown opened via selector', { sel });
+        break;
+      }
+    }
   }
 
-  logger.info('Newsletter picker detected — selecting', { displayName });
+  // JavaScript fallback: find a small button near the top of the page with a profile photo
+  if (!dropdownOpened) {
+    logger.info('Trying JS fallback for dropdown trigger');
+    const jsOpened = await page.evaluate(() => {
+      const candidates = Array.from(
+        document.querySelectorAll('button, [role="button"]'),
+      ) as HTMLElement[];
+      for (const el of candidates) {
+        if (el.querySelector('img')) {
+          const rect = el.getBoundingClientRect();
+          // The trigger is in the editor header: y < 150, not far right
+          if (rect.top < 150 && rect.top > 5 && rect.left < 700 && rect.width > 40) {
+            el.click();
+            return true;
+          }
+        }
+      }
+      return false;
+    });
+    if (jsOpened) {
+      await humanDelay(800);
+      dropdownOpened = await page
+        .getByText('Publish as', { exact: false })
+        .isVisible({ timeout: 3000 })
+        .catch(() => false);
+    }
+  }
 
-  // Click the option that matches our newsletter's display name
-  const option = page
-    .locator(`text="${displayName}", [aria-label*="${displayName}" i]`)
-    .first();
+  if (!dropdownOpened) {
+    await saveDebugScreenshot(page, 'dropdown-open-failed');
+    throw new Error(
+      'Could not open the author/newsletter dropdown in the article editor. ' +
+        'LinkedIn may have updated its UI — check debug screenshots and update selectors in linkedin.ts.',
+    );
+  }
 
-  if (await option.isVisible({ timeout: 5_000 }).catch(() => false)) {
-    await option.click();
-    await humanDelay(1000);
+  // ── Select "Publish as": Julio G. Martinez-Clark ───────────────────────────
+  logger.info('Selecting author', { author: AUTHOR_NAME });
+
+  // Prefer clicking the list item (li) that contains the author name
+  const authorLi = page.locator('li').filter({ hasText: AUTHOR_NAME }).first();
+  if (await authorLi.isVisible({ timeout: 5000 }).catch(() => false)) {
+    await authorLi.click();
   } else {
-    // Try a partial match (strip the ™ if it causes encoding issues)
-    const partial = displayName.replace('™', '').trim();
-    const partialOption = page.locator(`text*="${partial}"`).first();
-    await partialOption.click();
-    await humanDelay(1000);
+    // Fallback: click directly on the text node
+    await page.getByText(AUTHOR_NAME, { exact: false }).first().click();
   }
-  logger.info('Newsletter selected in picker');
+  await humanDelay(600);
+  logger.info('Author selected');
+
+  // ── Select "Publish to": target newsletter ─────────────────────────────────
+  logger.info('Selecting newsletter', { newsletter: newsletterDisplayName });
+
+  // Try exact display name first, then strip the ™ symbol as fallback
+  const newsletterLi = page.locator('li').filter({ hasText: newsletterDisplayName }).first();
+  if (await newsletterLi.isVisible({ timeout: 5000 }).catch(() => false)) {
+    await newsletterLi.click();
+  } else {
+    const partial = newsletterDisplayName.replace(/™/g, '').trim();
+    const partialLi = page.locator('li').filter({ hasText: partial }).first();
+    if (await partialLi.isVisible({ timeout: 3000 }).catch(() => false)) {
+      await partialLi.click();
+    } else {
+      // Last resort: direct text click
+      await page.getByText(partial, { exact: false }).first().click();
+    }
+  }
+  await humanDelay(600);
+  logger.info('Newsletter selected');
+
+  // ── Close the dropdown ─────────────────────────────────────────────────────
+  // Press Escape or click on the editor area to dismiss the panel
+  await page.keyboard.press('Escape');
+  await humanDelay(500);
+  logger.info('Author/newsletter selection complete');
 }

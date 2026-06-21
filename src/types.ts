@@ -2,18 +2,22 @@ export type NewsletterKey = 'gta' | 'lrd';
 
 export interface NewsletterConfig {
   displayName: string;
-  /** Public URL of the newsletter index page — used to click the "Write" button */
-  indexUrl: string;
+  /**
+   * The numeric LinkedIn newsletter ID (from the newsletter URL).
+   * Used as a fallback for direct URL navigation. Optional — the primary
+   * flow uses the /article/new/ dropdown to select the newsletter.
+   */
+  newsletterId?: string;
 }
 
 export const NEWSLETTERS: Record<NewsletterKey, NewsletterConfig> = {
   gta: {
     displayName: 'Global Trial Accelerators™',
-    indexUrl: 'https://www.linkedin.com/newsletters/global-trial-accelerators',
+    // GTA newsletter ID not confirmed; the /article/new/ dropdown flow handles this.
   },
   lrd: {
     displayName: 'LATAM Regulatory Dispatch™',
-    indexUrl: 'https://www.linkedin.com/newsletters/latam-regulatory-dispatch%E2%84%A2-7448736447437803520/',
+    newsletterId: '7448736447437803520',
   },
 };
 
