@@ -208,7 +208,8 @@ function humanDelay(ms: number): Promise<void> {
 
 async function saveDebugScreenshot(page: Page, label: string): Promise<void> {
   try {
-    const dir = path.join(process.cwd(), 'debug-screenshots');
+    // Use the persistent volume path so screenshots survive redeploys
+    const dir = path.join('/data', 'debug-screenshots');
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     const file = path.join(dir, `${label}-${Date.now()}.png`);
     await page.screenshot({ path: file, fullPage: true });
