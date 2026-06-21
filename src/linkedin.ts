@@ -219,6 +219,12 @@ async function saveDebugScreenshot(page: Page, label: string): Promise<void> {
   }
 }
 
+// ── Julio's LinkedIn profile URN ──────────────────────────────────────────────
+// Confirmed via browser investigation 2026-06-21. The article editor URL's
+// ?author= parameter accepts this URN to pre-select Julio as the publisher,
+// skipping the "Publish as" dropdown step entirely.
+const JULIO_PROFILE_URN = 'urn:li:fsd_profile:ACoAAAANE8MBRcTFSYWJy3xBByRzEB2dsaCuYOg';
+
 // ── Main publish flow ─────────────────────────────────────────────────────────
 
 export async function publishNewsletter(req: PublishRequest): Promise<PublishResponse> {
@@ -236,12 +242,14 @@ export async function publishNewsletter(req: PublishRequest): Promise<PublishRes
   page.setDefaultNavigationTimeout(config.navTimeoutMs);
 
   try {
-    // ── Step 1: Navigate to the article editor ────────────────────────────────
-    // We go directly to /article/new/ rather than the newsletter index page.
-    // The newsletter index approach is broken for GTA (URL has no numeric ID).
-    // The editor's author/newsletter dropdown lets us select any newsletter.
-    logger.info('Navigating to article editor');
-    await page.goto('https://www.linkedin.com/article/new/', { waitUntil: 'domcontentloaded' });
+    // ── Step 1: Navigate to the article editor with Julio pre-selected ────────
+    // We include ?author=<JULIO_URN> so LinkedIn pre-selects "Julio G. Martinez-Clark"
+    // under "Publish as". We still need to select the newsletter under "Publish to".
+    // This avoids the need to interact with the "Publish as" section of the dropdown.
+    const authorParam = encodeURIComponent(JULIO_PROFILE_URN);
+    const editorUrl = `https://www.linkedin.com/article/new/?author=${authorParam}`;
+    logger.info('Navigating to article editor', { url: editorUrl });
+    await page.goto(editorUrl, { waitUntil: 'domcontentloaded' });
 
     // Check for auth wall
     const currentUrl = page.url();
@@ -253,13 +261,17 @@ export async function publishNewsletter(req: PublishRequest): Promise<PublishRes
       };
     }
 
-    await humanDelay(2000);
+    // Wait for the editor title field to appear — confirms the editor is ready
+    await page
+      .locator('[placeholder*="Title" i], h1[contenteditable="true"]')
+      .first()
+      .waitFor({ state: 'visible', timeout: config.navTimeoutMs });
+    await humanDelay(1500);
     await saveDebugScreenshot(page, `01-editor-opened-${req.newsletter}`);
 
-    // ── Step 2: Select "Julio G. Martinez-Clark" (Publish as) + newsletter ────
-    // The editor shows a dropdown at the top-left with "Publish as" and "Publish to"
-    // sections. We must select Julio's personal profile and the target newsletter.
-    await selectAuthorAndNewsletter(page, newsletter.displayName);
+    // ── Step 2: Open the dropdown and select the target newsletter ────────────
+    // "Publish as" is already set via the URL. We only need to select "Publish to".
+    await selectNewsletterFromDropdown(page, newsletter.displayName);
     await saveDebugScreenshot(page, `02-newsletter-selected-${req.newsletter}`);
 
     // ── Step 3: Upload cover image ────────────────────────────────────────────
@@ -365,132 +377,154 @@ export async function publishNewsletter(req: PublishRequest): Promise<PublishRes
   }
 }
 
-// ── Author + newsletter picker helper ─────────────────────────────────────────
+// ── Newsletter picker helper ───────────────────────────────────────────────────
 
 /**
- * Opens the "Publish as / Publish to" dropdown at the top of the article editor
- * and selects:
- *   - "Publish as": Julio G. Martinez-Clark (personal profile)
- *   - "Publish to": the target newsletter by display name
+ * Opens the "Publish as / Publish to" dropdown and selects the target newsletter
+ * under "Publish to". Since we navigate with ?author=<JULIO_URN>, the "Publish as"
+ * section is already set to Julio G. Martinez-Clark — we only need to click the
+ * correct newsletter.
  *
- * The dropdown is a panel with two sections:
- *   "Publish as" — list of author profiles (personal + company pages)
- *   "Publish to" — "Individual article" or a newsletter
- *
- * Confirmed via browser investigation on 2026-06-21: the dropdown trigger is a
- * button in the editor header containing a profile photo and the current
- * author/newsletter name. After selecting Julio under "Publish as", the URL
- * updates to ?author=urn:li:fsd_profile:... and the "Publish to" list shows
- * "Individual article", "LATAM Regulatory Dispatch™", and "Global Trial Accelerators™".
+ * All element targeting uses getBoundingClientRect() visibility checks (via
+ * page.evaluate) to avoid matching LinkedIn's hidden JSON data blobs, which appear
+ * as <code> elements containing the same text strings and cause Playwright locators
+ * to resolve to the wrong (invisible) element.
  */
-async function selectAuthorAndNewsletter(
+async function selectNewsletterFromDropdown(
   page: Page,
   newsletterDisplayName: string,
 ): Promise<void> {
-  const AUTHOR_NAME = 'Julio G. Martinez-Clark';
+  // ── Open the dropdown trigger ──────────────────────────────────────────────
+  logger.info('Opening newsletter picker dropdown');
 
-  // ── Open the dropdown ──────────────────────────────────────────────────────
-  logger.info('Opening author/newsletter dropdown');
-  let dropdownOpened = false;
+  // Use JS to find and click the dropdown trigger. The trigger is the widest
+  // visible button in the editor header (top ~120px). Formatting toolbar buttons
+  // are narrow (~30px each); the author/newsletter trigger is wide (~150–200px).
+  const triggerClicked = await page.evaluate((): boolean => {
+    const isVisible = (el: Element): boolean => {
+      const rect = el.getBoundingClientRect();
+      if (rect.width < 20 || rect.height < 5) return false;
+      if (rect.top < 0 || rect.top > window.innerHeight) return false;
+      const s = window.getComputedStyle(el as HTMLElement);
+      return s.display !== 'none' && s.visibility !== 'hidden' && parseFloat(s.opacity) > 0.1;
+    };
 
-  // Try Playwright locators first (most stable)
-  const triggerSelectors = [
-    'button[aria-haspopup="listbox"]',
-    'button[aria-haspopup="true"]',
-    '[role="button"][aria-haspopup]',
-    '.artdeco-dropdown__trigger',
-  ];
+    const buttons = Array.from(
+      document.querySelectorAll('button, [role="button"]'),
+    ) as HTMLElement[];
 
-  for (const sel of triggerSelectors) {
-    const el = page.locator(sel).first();
-    if (await el.isVisible({ timeout: 2000 }).catch(() => false)) {
-      await el.click();
-      await humanDelay(800);
-      const hasPublishAs = await page
-        .getByText('Publish as', { exact: false })
-        .isVisible({ timeout: 3000 })
-        .catch(() => false);
-      if (hasPublishAs) {
-        dropdownOpened = true;
-        logger.info('Dropdown opened via selector', { sel });
-        break;
-      }
-    }
-  }
+    // Candidates: visible buttons in the editor header area
+    const candidates = buttons
+      .filter((btn) => isVisible(btn))
+      .map((btn) => ({ btn, rect: btn.getBoundingClientRect() }))
+      .filter(({ rect }) => rect.top > 5 && rect.top < 120 && rect.left < 700 && rect.width > 80);
 
-  // JavaScript fallback: find a small button near the top of the page with a profile photo
-  if (!dropdownOpened) {
-    logger.info('Trying JS fallback for dropdown trigger');
-    const jsOpened = await page.evaluate(() => {
-      const candidates = Array.from(
-        document.querySelectorAll('button, [role="button"]'),
-      ) as HTMLElement[];
-      for (const el of candidates) {
-        if (el.querySelector('img')) {
-          const rect = el.getBoundingClientRect();
-          // The trigger is in the editor header: y < 150, not far right
-          if (rect.top < 150 && rect.top > 5 && rect.left < 700 && rect.width > 40) {
-            el.click();
-            return true;
-          }
-        }
-      }
-      return false;
-    });
-    if (jsOpened) {
-      await humanDelay(800);
-      dropdownOpened = await page
-        .getByText('Publish as', { exact: false })
-        .isVisible({ timeout: 3000 })
-        .catch(() => false);
-    }
-  }
+    if (candidates.length === 0) return false;
 
-  if (!dropdownOpened) {
-    await saveDebugScreenshot(page, 'dropdown-open-failed');
+    // Click the widest candidate — that's the author/newsletter dropdown trigger
+    candidates.sort((a, b) => b.rect.width - a.rect.width);
+    candidates[0].btn.click();
+    return true;
+  });
+
+  if (!triggerClicked) {
+    await saveDebugScreenshot(page, 'dropdown-trigger-not-found');
     throw new Error(
-      'Could not open the author/newsletter dropdown in the article editor. ' +
-        'LinkedIn may have updated its UI — check debug screenshots and update selectors in linkedin.ts.',
+      'Could not find the newsletter picker dropdown trigger in the editor header. ' +
+        'Check debug screenshots. LinkedIn may have updated its UI.',
     );
   }
 
-  // ── Select "Publish as": Julio G. Martinez-Clark ───────────────────────────
-  logger.info('Selecting author', { author: AUTHOR_NAME });
+  await humanDelay(1000);
 
-  // Prefer clicking the list item (li) that contains the author name
-  const authorLi = page.locator('li').filter({ hasText: AUTHOR_NAME }).first();
-  if (await authorLi.isVisible({ timeout: 5000 }).catch(() => false)) {
-    await authorLi.click();
-  } else {
-    // Fallback: click directly on the text node
-    await page.getByText(AUTHOR_NAME, { exact: false }).first().click();
-  }
-  await humanDelay(600);
-  logger.info('Author selected');
-
-  // ── Select "Publish to": target newsletter ─────────────────────────────────
-  logger.info('Selecting newsletter', { newsletter: newsletterDisplayName });
-
-  // Try exact display name first, then strip the ™ symbol as fallback
-  const newsletterLi = page.locator('li').filter({ hasText: newsletterDisplayName }).first();
-  if (await newsletterLi.isVisible({ timeout: 5000 }).catch(() => false)) {
-    await newsletterLi.click();
-  } else {
-    const partial = newsletterDisplayName.replace(/™/g, '').trim();
-    const partialLi = page.locator('li').filter({ hasText: partial }).first();
-    if (await partialLi.isVisible({ timeout: 3000 }).catch(() => false)) {
-      await partialLi.click();
-    } else {
-      // Last resort: direct text click
-      await page.getByText(partial, { exact: false }).first().click();
+  // ── Verify dropdown opened (real visibility check) ─────────────────────────
+  // Use getBoundingClientRect() rather than Playwright .isVisible() to avoid
+  // false-positives from hidden <code> JSON blobs that contain the same text.
+  const dropdownOpen = await page.evaluate((): boolean => {
+    const isReallyVisible = (el: Element | null): boolean => {
+      if (!el) return false;
+      const rect = el.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) return false;
+      if (rect.top < 0 || rect.bottom > window.innerHeight + 200) return false;
+      const s = window.getComputedStyle(el as HTMLElement);
+      return s.display !== 'none' && s.visibility !== 'hidden' && parseFloat(s.opacity) > 0.1;
+    };
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    let node: Node | null;
+    while ((node = walker.nextNode())) {
+      const t = ((node as Text).textContent ?? '').trim();
+      if ((t === 'Publish as' || t === 'Publish to') && isReallyVisible((node as Text).parentElement)) {
+        return true;
+      }
     }
-  }
-  await humanDelay(600);
-  logger.info('Newsletter selected');
+    return false;
+  });
 
-  // ── Close the dropdown ─────────────────────────────────────────────────────
-  // Press Escape or click on the editor area to dismiss the panel
+  if (!dropdownOpen) {
+    await saveDebugScreenshot(page, 'dropdown-not-open');
+    logger.warn('Dropdown may not be visible — trying coordinate-based click fallback');
+    // Fallback: click at the known approximate position of the trigger in a 1280×900 viewport.
+    // Measured during browser investigation on 2026-06-21: trigger is at ~(260, 57).
+    await page.mouse.click(260, 57);
+    await humanDelay(1000);
+  }
+
+  // ── Click the target newsletter ────────────────────────────────────────────
+  // Walk all visible text nodes looking for the newsletter name. "LATAM Regulatory
+  // Dispatch" and "Global Trial Accelerators" appear in the dropdown items, but also
+  // in hidden JSON blobs. getBoundingClientRect() lets us skip the hidden ones.
+  const searchText = newsletterDisplayName.replace(/™/g, '').trim();
+  logger.info('Clicking newsletter option', { searchText });
+
+  let clicked = false;
+  for (let attempt = 0; attempt < 5 && !clicked; attempt++) {
+    if (attempt > 0) {
+      logger.info('Retrying newsletter click', { attempt });
+      await humanDelay(600);
+    }
+
+    clicked = await page.evaluate((text): boolean => {
+      const isReallyVisible = (el: Element | null): boolean => {
+        if (!el) return false;
+        const rect = el.getBoundingClientRect();
+        if (rect.width < 20 || rect.height < 5) return false;
+        if (rect.top < 0 || rect.top > window.innerHeight) return false;
+        const s = window.getComputedStyle(el as HTMLElement);
+        return s.display !== 'none' && s.visibility !== 'hidden' && parseFloat(s.opacity) > 0.1;
+      };
+
+      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+      let node: Node | null;
+      while ((node = walker.nextNode())) {
+        if (!((node as Text).textContent ?? '').includes(text)) continue;
+        // Walk up the DOM to find the nearest visible ancestor we can click
+        let el: HTMLElement | null = (node as Text).parentElement;
+        for (let i = 0; i < 8; i++) {
+          if (!el || el.tagName === 'BODY' || el.tagName === 'HTML') break;
+          if (isReallyVisible(el)) {
+            el.click();
+            return true;
+          }
+          el = el.parentElement;
+        }
+      }
+      return false;
+    }, searchText);
+  }
+
+  if (!clicked) {
+    await saveDebugScreenshot(page, 'newsletter-item-not-found');
+    throw new Error(
+      `Could not find a visible "${newsletterDisplayName}" item in the newsletter dropdown. ` +
+        'Check debug screenshots.',
+    );
+  }
+
+  await humanDelay(600);
+
+  // Close dropdown if still open
   await page.keyboard.press('Escape');
   await humanDelay(500);
-  logger.info('Author/newsletter selection complete');
+
+  logger.info('Newsletter selection complete', { newsletter: newsletterDisplayName });
 }
