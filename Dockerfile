@@ -1,6 +1,6 @@
 # ── Stage 1: TypeScript compiler ──────────────────────────────────────────────
 # Use the official Playwright image so we have the same Node version in both stages.
-FROM mcr.microsoft.com/playwright:v1.49.1-noble AS builder
+FROM mcr.microsoft.com/playwright:v1.61.0-noble AS builder
 
 WORKDIR /build
 COPY package*.json tsconfig.json ./
@@ -9,7 +9,7 @@ COPY src/ ./src/
 RUN npm run build
 
 # ── Stage 2: Production image ──────────────────────────────────────────────────
-FROM mcr.microsoft.com/playwright:v1.49.1-noble
+FROM mcr.microsoft.com/playwright:v1.61.0-noble
 
 WORKDIR /app
 
