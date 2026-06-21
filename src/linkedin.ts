@@ -332,16 +332,77 @@ export async function publishNewsletter(req: PublishRequest): Promise<PublishRes
       .first();
     await nextButton.waitFor({ state: 'visible', timeout: config.stepTimeoutMs });
     await nextButton.click();
-    await humanDelay(2000);
+    await humanDelay(2500);
     await saveDebugScreenshot(page, `05-next-clicked-${req.newsletter}`);
 
-    // ── Step 7: Click "Publish" ───────────────────────────────────────────────
-    logger.info('Clicking Publish');
-    const publishButton = page
-      .locator('button:has-text("Publish"), [aria-label="Publish"]')
-      .first();
-    await publishButton.waitFor({ state: 'visible', timeout: config.stepTimeoutMs });
-    await publishButton.click();
+    // ── Step 7: Handle multi-step Next + click "Publish" ─────────────────────
+    // LinkedIn's article editor sometimes has a 2-step Next flow (editor → settings
+    // panel → publish confirmation). We check for a second "Next" first, then look
+    // for the Publish/Post button using both Playwright and JS visibility checks.
+    // Also covers renamed buttons: "Publish", "Post", "Publish article", etc.
+    logger.info('Checking for second Next or Publish button');
+    await saveDebugScreenshot(page, `06-before-publish-${req.newsletter}`);
+
+    const NEXT_SEL = 'button:has-text("Next"), [aria-label="Next"]';
+    const secondNextVisible = await page
+      .locator(NEXT_SEL)
+      .first()
+      .isVisible({ timeout: 3000 })
+      .catch(() => false);
+    if (secondNextVisible) {
+      logger.info('Clicking second Next (multi-step flow)');
+      await page.locator(NEXT_SEL).first().click();
+      await humanDelay(2000);
+      await saveDebugScreenshot(page, `06b-second-next-${req.newsletter}`);
+    }
+
+    // Try Playwright locator first (covers text variants LinkedIn might use)
+    const PUBLISH_SEL = [
+      'button:has-text("Publish")',
+      'button:has-text("Publish article")',
+      'button:has-text("Publish now")',
+      'button:has-text("Post")',
+      'button:has-text("Post article")',
+      '[aria-label="Publish"]',
+      '[aria-label="Post"]',
+    ].join(', ');
+
+    const publishButton = page.locator(PUBLISH_SEL).first();
+    const publishVisible = await publishButton
+      .isVisible({ timeout: config.stepTimeoutMs })
+      .catch(() => false);
+
+    if (publishVisible) {
+      logger.info('Clicking Publish button via Playwright');
+      await publishButton.click();
+    } else {
+      // JS fallback: find a visible button with any publish-like text
+      logger.info('Publish button not found via Playwright — trying JS fallback');
+      await saveDebugScreenshot(page, `07-publish-not-found-${req.newsletter}`);
+      const publishTexts = ['Publish', 'Publish article', 'Publish now', 'Post', 'Post article'];
+      const jsClicked = await page.evaluate((texts: string[]): string | null => {
+        const isVisible = (el: Element): boolean => {
+          const rect = el.getBoundingClientRect();
+          return rect.width > 20 && rect.height > 5 &&
+                 rect.top >= 0 && rect.top < window.innerHeight;
+        };
+        const buttons = Array.from(document.querySelectorAll('button')) as HTMLButtonElement[];
+        for (const text of texts) {
+          const btn = buttons.find(
+            (b) => b.textContent?.trim().toLowerCase() === text.toLowerCase() && isVisible(b),
+          );
+          if (btn) { btn.click(); return text; }
+        }
+        return null;
+      }, publishTexts);
+      if (!jsClicked) {
+        throw new Error(
+          'Could not find Publish button after clicking Next. ' +
+            'Check debug screenshots for the page state at this step.',
+        );
+      }
+      logger.info('Publish button clicked via JS', { buttonText: jsClicked });
+    }
 
     // Wait for navigation to the published article
     await page.waitForURL(
