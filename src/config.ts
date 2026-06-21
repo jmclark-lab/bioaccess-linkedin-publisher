@@ -1,5 +1,3 @@
-import path from 'path';
-
 function required(name: string): string {
   const v = process.env[name];
   if (!v) throw new Error(`Missing required environment variable: ${name}`);
@@ -18,8 +16,12 @@ export const config = {
     return required('BIOACCESS_TOKEN');
   },
 
-  /** Absolute path to Playwright storage-state JSON (lives on persistent volume) */
-  sessionFile: optional('SESSION_FILE', path.join(process.cwd(), 'data', 'session.json')),
+  /**
+   * Absolute path to Playwright storage-state JSON.
+   * Defaults to /data/session.json — the Railway persistent volume mount point.
+   * Override with SESSION_FILE env var for local dev (e.g. ./data/session.json).
+   */
+  sessionFile: optional('SESSION_FILE', '/data/session.json'),
 
   /** Supabase Edge Function URL for success/failure webhook */
   webhookUrl: optional(

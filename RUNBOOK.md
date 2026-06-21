@@ -2,102 +2,107 @@
 
 > Internal ops doc. Do not share publicly.
 
-**Service:** `https://bioaccess-linkedin-publisher.fly.dev`  
+**Service URL:** `https://bioaccess-linkedin-publisher-production.up.railway.app`  
 **Auth header:** `x-bioaccess-token: <BIOACCESS_TOKEN>`  
-**Newsletters:**  
-- `gta` → Global Trial Accelerators™  
+**Newsletters:**
+- `gta` → Global Trial Accelerators™
 - `lrd` → LATAM Regulatory Dispatch™
 
 ---
 
-## 1. Initial Deploy
+## 1. Railway Setup (first time or after service loss)
 
 ### Prerequisites
-- [Fly.io CLI](https://fly.io/docs/hands-on/install-flyctl/) installed and authenticated (`fly auth login`)
-- Docker installed locally (used only for `fly deploy`)
+- Railway account at [railway.app](https://railway.app)
+- GitHub repo: `https://github.com/jmclark-lab/bioaccess-linkedin-publisher`
 
-### Steps
+### Steps in Railway dashboard
+
+1. Create project → **New Project** → **Deploy from GitHub repo** → select `jmclark-lab/bioaccess-linkedin-publisher`
+2. Railway auto-detects `railway.toml` and uses the Dockerfile.
+3. **Variables tab** → add these secrets:
+
+   | Variable | Value |
+   |----------|-------|
+   | `BIOACCESS_TOKEN` | `c76d794ae7d390f2fd38c460b49950f3b048bb2c14f990b04af1b056fe5aad14` |
+   | `SUPABASE_WEBHOOK_TOKEN` | *(your Supabase service key)* |
+
+   > `SESSION_FILE` defaults to `/data/session.json` — no override needed.
+
+4. **Volumes tab** → **New Volume** → Mount path: `/data` → Size: 1 GB
+   > This is where LinkedIn cookies persist across redeploys. Without this volume, cookies reset on every deploy.
+
+5. Wait for the build to complete (2–4 min — the Playwright image is large).
+6. Verify:
 
 ```bash
-cd "playwright-linkedin-service"
-
-# Create the app (first time only)
-fly apps create bioaccess-linkedin-publisher
-
-# Create the persistent volume (first time only)
-# This stores LinkedIn session cookies across deploys
-fly volumes create linkedin_session --region ewr --size 1
-
-# Set secrets (never commit these)
-fly secrets set \
-  BIOACCESS_TOKEN="$(openssl rand -hex 32)" \
-  SUPABASE_WEBHOOK_TOKEN="<your-supabase-anon-or-service-key>"
-
-# Deploy
-fly deploy
-
-# Confirm it's running
-fly status
-curl https://bioaccess-linkedin-publisher.fly.dev/health
+curl https://bioaccess-linkedin-publisher-production.up.railway.app/health
+# Expected: {"status":"ok","session_file_exists":false,...}
 ```
 
-After deploy, the health endpoint will return `session_alive: false` until you import cookies (Step 2).
+After deploy, `session_file_exists` will be `false` until you upload cookies (Section 2).
 
 ---
 
-## 2. Bootstrapping the LinkedIn Session (First Time)
+## 2. Bootstrapping the LinkedIn Session (first time or after expiry)
 
 LinkedIn has no API for newsletter publishing. We authenticate via session cookies.
 
-### Step-by-step (takes ~5 minutes)
+### Step-by-step (~5 minutes)
 
-1. **Install "Cookie-Editor"** browser extension  
+1. **Install "Cookie-Editor"** browser extension
    Chrome: https://chrome.google.com/webstore/detail/cookie-editor/hlkenndednhfkekhgcdicdfddnkalmdm
+   Use **v1.13.0** — newer versions removed the clipboard export button.
 
-2. **Log into LinkedIn** as `jmclark@bioaccessla.com` in your normal browser.  
-   Make sure you can see the LinkedIn home feed (not a CAPTCHA or verification page).
+2. **Log into LinkedIn** as `jmclark@bioaccessla.com` in your normal browser.
+   Make sure you see the LinkedIn home feed (not a CAPTCHA or verification page).
 
 3. **Export cookies:**
-   - Click the Cookie-Editor icon in the toolbar
-   - Click "Export" → "Export as JSON"
-   - Copy the entire JSON array
+   - Click the Cookie-Editor icon
+   - Click **Export** → **Export as JSON** → copies to clipboard
 
-4. **POST the cookies to the service:**
+4. **Run the upload script** from the `playwright-linkedin-service` folder:
 
 ```bash
-# Replace TOKEN and paste the cookie JSON as the value of "cookies"
-curl -X POST https://bioaccess-linkedin-publisher.fly.dev/admin/update-session \
-  -H "x-bioaccess-token: <BIOACCESS_TOKEN>" \
-  -H "Content-Type: application/json" \
-  -d '{"cookies": [ ... paste Cookie-Editor JSON here ... ]}'
+cd "~/Claude/Projects/Website Updates/playwright-linkedin-service"
+./upload-session.sh
 ```
 
-   Expected response: `{"success":true,"message":"Session updated with N cookies..."}`
+   When prompted, **paste** the cookie JSON (Cmd+V) and press **Ctrl+D**.
+   Do not type anything else after pasting — extra input corrupts the file.
 
-5. **Verify the session:**
+   Expected output:
+   ```
+   Found 23 cookies. Uploading to Railway...
+   Response: {"success":true,"message":"Session updated with 23 cookies..."}
+   ```
+
+5. **Verify:**
 ```bash
-curl https://bioaccess-linkedin-publisher.fly.dev/health
-# Should return: {"status":"ok","session_alive":true,...}
+curl https://bioaccess-linkedin-publisher-production.up.railway.app/health
+# Expected: {"status":"ok","session_file_exists":true,...}
 ```
+
+   > `session_alive` will show `false` — this is normal. It only becomes `true`
+   > after the first actual publish call (browser launches lazily).
 
 ---
 
 ## 3. Quarterly Session Refresh
 
-LinkedIn sessions typically last 3–6 months before expiring.
+LinkedIn sessions last 3–6 months.
 
-**Trigger:** The `/health` endpoint returns `session_alive: false`.  
-**Alert:** The Supabase webhook will also report failures.
+**Trigger:** Perplexity cron returns a `SESSION_EXPIRED` error, or `/health` returns `session_file_exists: false`.
 
-Repeat the same steps as Section 2. The `/admin/update-session` endpoint overwrites the old cookies.
+Repeat Section 2. The `/admin/update-session` endpoint overwrites the old cookies.
 
 ---
 
 ## 4. Publishing a Newsletter Article (Manual Test)
 
 ```bash
-curl -X POST https://bioaccess-linkedin-publisher.fly.dev/publish-newsletter \
-  -H "x-bioaccess-token: <BIOACCESS_TOKEN>" \
+curl -X POST https://bioaccess-linkedin-publisher-production.up.railway.app/publish-newsletter \
+  -H "x-bioaccess-token: c76d794ae7d390f2fd38c460b49950f3b048bb2c14f990b04af1b056fe5aad14" \
   -H "Content-Type: application/json" \
   -d '{
     "newsletter": "gta",
@@ -117,89 +122,113 @@ Expected response:
 
 ---
 
-## 5. Updating the Perplexity Computer Crons
+## 5. Perplexity Crons
 
-Once the service is live and verified, update these two cron task bodies:
+The two Perplexity crons handle content generation and call this service for the publish step.
 
-| Cron | ID | Session |
-|------|-----|---------|
-| GTA Newsletter | `19df4851` | `c9949730` |
-| LRD Newsletter | `a0fabe2b` | `c9949730` |
+| Cron | Newsletter | Schedule |
+|------|------------|----------|
+| GTA (`0fc88c0b`) | Global Trial Accelerators™ | Tuesday 10 AM ET |
+| LRD (`73b61ccd`) | LATAM Regulatory Dispatch™ | Wednesday 10 AM ET |
 
-Replace the `use_local_browser` / `browser_task` calls with:
-
+Each cron POSTs to:
 ```
-POST https://bioaccess-linkedin-publisher.fly.dev/publish-newsletter
-x-bioaccess-token: <BIOACCESS_TOKEN>
+POST https://bioaccess-linkedin-publisher-production.up.railway.app/publish-newsletter
+x-bioaccess-token: c76d794ae7d390f2fd38c460b49950f3b048bb2c14f990b04af1b056fe5aad14
 Content-Type: application/json
 
 {
-  "newsletter": "gta",
+  "newsletter": "gta" | "lrd",
   "title": "<generated title>",
   "body_markdown": "<generated body>",
   "cover_image_url": "<optional cover URL>"
 }
 ```
 
-The service returns the published `article_url` which the cron can log or use downstream.
+The service returns `{"success": true, "article_url": "..."}` on success.
 
 ---
 
-## 6. Debug Screenshots
+## 6. Diagnosing a Failed Deployment ("Application not found")
 
-If a publish fails, the service saves debug screenshots to `/data/debug-screenshots/` on the Fly volume. Access via:
+Railway returns "Application not found" when the service isn't running or the domain mapping is lost.
 
-```bash
-fly ssh console -a bioaccess-linkedin-publisher
-ls /data/debug-screenshots/
-# Copy a screenshot to local:
-# fly sftp get /data/debug-screenshots/error-gta-1234567890.png
-```
+**Step 1 — Check Railway dashboard:**
+1. Go to [railway.app](https://railway.app) → your project
+2. Click the `bioaccess-linkedin-publisher` service
+3. Look at the **Deployments** tab:
+   - 🟢 **Active** → service is running; check if the domain is correct under Settings → Networking
+   - 🔴 **Failed/Crashed** → open the deployment → **View Logs** → look for the error
+
+**Most common crash cause:** `Missing required environment variable: BIOACCESS_TOKEN`
+Fix: Go to **Variables** tab → add `BIOACCESS_TOKEN` → Railway auto-redeploys.
+
+**Step 2 — Force redeploy:**
+In the Deployments tab → click the latest deployment → **Redeploy**.
+
+**Step 3 — Verify the domain:**
+Settings → Networking → the generated domain should be:
+`bioaccess-linkedin-publisher-production.up.railway.app`
+If it shows a different URL, use that URL instead (and update the Perplexity crons).
 
 ---
 
 ## 7. Viewing Logs
 
+**Railway dashboard:** Project → Service → **Logs** tab (real-time).
+
+**Via CLI (optional):**
 ```bash
-fly logs -a bioaccess-linkedin-publisher
-# Follow in real time:
-fly logs -a bioaccess-linkedin-publisher --follow
+brew install railway
+railway login
+railway link   # select romantic-insight project, bioaccess-linkedin-publisher service
+railway logs
 ```
 
 ---
 
-## 8. Updating Selectors After LinkedIn UI Changes
+## 8. Debug Screenshots
 
-LinkedIn's UI changes periodically. If publishes start failing, check the debug screenshots and update `src/linkedin.ts`. The selectors to update are clearly commented with `// LinkedIn article editor:` in the file.
+If a publish fails, the service saves debug screenshots to `/data/debug-screenshots/` on the Railway volume. Access via Railway dashboard → **Volumes** tab → browse files, or via CLI:
 
-After editing, rebuild and redeploy:
+```bash
+railway run ls /data/debug-screenshots/
+```
+
+---
+
+## 9. Updating Selectors After LinkedIn UI Changes
+
+LinkedIn's UI changes periodically. If publishes start failing, check the debug screenshots and update `src/linkedin.ts`. Selectors are clearly commented with `// LinkedIn article editor:`.
+
+After editing:
 ```bash
 npm run build
-fly deploy
+git add -A && git commit -m "fix: update LinkedIn selectors"
+git push
+# Railway auto-deploys from the main branch
 ```
 
 ---
 
-## 9. Cost Estimate
+## 10. Cost Estimate
 
 | Resource | Spec | Monthly |
 |----------|------|---------|
-| Fly.io Machine | shared-cpu-1x, 1 GB RAM | ~$3.83 |
-| Persistent Volume | 1 GB | ~$0.15 |
-| **Total** | | **~$4/month** |
+| Railway Hobby | Shared CPU, 512 MB RAM | ~$5 base |
+| Persistent Volume | 1 GB | ~$0.25 |
+| **Total** | | **~$5–6/month** |
 
-With `auto_stop_machines = true`, the machine only runs during active requests (~2 × weekly crons × ~3 min each). Fly's free allowance covers much of this — actual bill may be $0–$2/month.
+Railway bills by usage. The service sleeps between requests (2× weekly crons × ~3 min each). Actual compute cost is minimal on top of the base plan.
 
 ---
 
-## 10. Emergency: Manual Publish via Fly SSH
+## 11. Emergency: Manual Publish via Railway CLI
 
 If the service is broken and a newsletter needs to go out immediately:
 
 ```bash
-fly ssh console -a bioaccess-linkedin-publisher
-# Inside the container:
-node -e "
+railway run node -e "
 const { publishNewsletter } = require('./dist/linkedin.js');
 publishNewsletter({
   newsletter: 'gta',
@@ -209,4 +238,4 @@ publishNewsletter({
 "
 ```
 
-Or ask Sharick to publish manually on LinkedIn as the fallback (same as the current setup).
+Or ask Sharick to publish manually on LinkedIn as the fallback.
