@@ -404,18 +404,71 @@ export async function publishNewsletter(req: PublishRequest): Promise<PublishRes
       logger.info('Publish button clicked via JS', { buttonText: jsClicked });
     }
 
-    // Wait for navigation to the published article
-    await page.waitForURL(
-      (url) =>
-        url.href.includes('/pulse/') &&
-        !url.href.includes('/new') &&
-        !url.href.includes('/article/new'),
-      { timeout: config.navTimeoutMs },
-    );
+    // Brief wait + screenshot to diagnose what happens after clicking Publish
+    await humanDelay(2500);
+    await saveDebugScreenshot(page, `07-after-publish-click-${req.newsletter}`);
 
-    const articleUrl = page.url();
+    // LinkedIn sometimes shows a confirmation dialog/step after the first Publish click
+    // (e.g. an additional review pane with a second "Publish" or "Publish now" button).
+    const FINAL_CONF_SEL = [
+      'button:has-text("Publish")',
+      'button:has-text("Publish article")',
+      'button:has-text("Publish now")',
+      'button:has-text("Post")',
+      '[aria-label="Publish now"]',
+    ].join(', ');
+    const finalConfirmVisible = await page
+      .locator(FINAL_CONF_SEL)
+      .first()
+      .isVisible({ timeout: 3000 })
+      .catch(() => false);
+    if (finalConfirmVisible) {
+      logger.info('Clicking final confirmation Publish button');
+      await page.locator(FINAL_CONF_SEL).first().click();
+      await humanDelay(2000);
+      await saveDebugScreenshot(page, `07b-final-confirm-clicked-${req.newsletter}`);
+    }
+
+    // Wait for navigation away from the article editor.
+    // Published newsletter articles land at /pulse/ but we also accept any non-editor URL
+    // in case LinkedIn redirects elsewhere (newsletter page, feed, etc.).
+    let articleUrl: string;
+    try {
+      await page.waitForURL(
+        (url) => !url.href.includes('/article/new'),
+        { timeout: config.navTimeoutMs },
+      );
+      articleUrl = page.url();
+      logger.info('Navigated to post-publish URL', { articleUrl });
+    } catch {
+      // Navigation timed out — article may still have published. Check page for article link.
+      await saveDebugScreenshot(page, `08-nav-timeout-${req.newsletter}`);
+      const linkHref = await page.evaluate((): string | null => {
+        const selectors = ['a[href*="/pulse/"]', 'a[href*="/article/"]'];
+        for (const sel of selectors) {
+          const links = Array.from(document.querySelectorAll(sel));
+          for (const link of links) {
+            const href = link.getAttribute('href') ?? '';
+            if (!href.includes('/new') && !href.includes('/article/new')) return href;
+          }
+        }
+        return null;
+      });
+      if (linkHref) {
+        articleUrl = linkHref.startsWith('http')
+          ? linkHref
+          : `https://www.linkedin.com${linkHref}`;
+        logger.info('Article URL found on page (no navigation occurred)', { articleUrl });
+      } else {
+        throw new Error(
+          'Publish was clicked but no navigation occurred and no article URL was found on the page. ' +
+            'Check debug screenshots (07-after-publish-click, 08-nav-timeout).',
+        );
+      }
+    }
+
     logger.info('Article published successfully', { articleUrl });
-    await saveDebugScreenshot(page, `06-published-${req.newsletter}`);
+    await saveDebugScreenshot(page, `09-published-${req.newsletter}`);
 
     // ── Step 8: Save updated session cookies ──────────────────────────────────
     await context.storageState({ path: config.sessionFile });
