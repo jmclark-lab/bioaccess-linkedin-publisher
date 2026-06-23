@@ -109,7 +109,16 @@ async function createContext(): Promise<BrowserContext> {
 
 /**
  * Opens a browser context, navigates to LinkedIn, and checks whether
- * the session is alive by looking for the authenticated feed indicator.
+ * the session is alive.
+ *
+ * Strategy: navigate to /feed/ and use multiple positive AND negative signals.
+ * LinkedIn changes its DOM frequently, so a single brittle selector check is
+ * unreliable. We combine:
+ *   - Final URL not redirected to /login, /authwall, /checkpoint, /signup, /uas/login
+ *   - URL still contains /feed/ (we landed where we wanted)
+ *   - Page does NOT contain a visible "Sign in" / "Join now" CTA
+ *   - At least one of several nav/profile indicators is present
+ * Any single positive signal is enough; any single negative signal forces dead.
  */
 export async function checkSessionAlive(): Promise<boolean> {
   if (!sessionFileExists()) return false;
@@ -121,21 +130,91 @@ export async function checkSessionAlive(): Promise<boolean> {
       waitUntil: 'domcontentloaded',
       timeout: config.navTimeoutMs,
     });
-    // If redirected to /login or /authwall, session is dead
+    // Brief wait for client-side hydration
+    await new Promise((r) => setTimeout(r, 2500));
+
     const url = page.url();
-    if (url.includes('/login') || url.includes('/authwall') || url.includes('/checkpoint')) {
-      logger.warn('Session expired — redirected to', { url });
+    logger.info('Session probe landed at URL', { url });
+
+    // ── Negative URL check: any of these means dead ───────────────────────────
+    if (
+      url.includes('/login') ||
+      url.includes('/authwall') ||
+      url.includes('/checkpoint') ||
+      url.includes('/signup') ||
+      url.includes('/uas/login') ||
+      url === 'https://www.linkedin.com/' // bare root means not authenticated
+    ) {
+      logger.warn('Session probe: redirected to auth/landing URL', { url });
       return false;
     }
-    // Look for the global navigation bar that only appears when logged in
-    const navExists = await page
-      .locator('[data-test-global-nav-link="home"], nav[aria-label*="primary" i], .global-nav__me')
-      .first()
-      .isVisible()
-      .catch(() => false);
-    return navExists;
+
+    // ── Positive URL check: still on /feed/? ──────────────────────────────────
+    const onFeed = url.includes('/feed');
+
+    // ── DOM signals (any one is enough) ───────────────────────────────────────
+    const positiveSelectors = [
+      '[data-test-global-nav-link="home"]',
+      'nav[aria-label*="primary" i]',
+      '.global-nav__me',
+      '.global-nav',
+      '[data-test-id*="global-nav" i]',
+      'a[href="/feed/"][aria-current]',
+      '[data-control-name*="identity_welcome_message" i]',
+      'header.global-nav',
+      'nav[role="navigation"]',
+    ];
+    const positiveDomMatch = await page.evaluate((sels: string[]): boolean => {
+      const isVisible = (el: Element | null): boolean => {
+        if (!el) return false;
+        const r = el.getBoundingClientRect();
+        if (r.width < 5 || r.height < 5) return false;
+        const s = window.getComputedStyle(el as HTMLElement);
+        return s.display !== 'none' && s.visibility !== 'hidden' && parseFloat(s.opacity) > 0.1;
+      };
+      return sels.some((sel) => {
+        try {
+          const el = document.querySelector(sel);
+          return isVisible(el);
+        } catch {
+          return false;
+        }
+      });
+    }, positiveSelectors);
+
+    // ── Negative DOM signal: visible "Sign in" / "Join now" buttons ──────────
+    const negativeDomMatch = await page.evaluate((): boolean => {
+      const isVisible = (el: Element | null): boolean => {
+        if (!el) return false;
+        const r = el.getBoundingClientRect();
+        if (r.width < 20 || r.height < 5) return false;
+        const s = window.getComputedStyle(el as HTMLElement);
+        return s.display !== 'none' && s.visibility !== 'hidden' && parseFloat(s.opacity) > 0.1;
+      };
+      const buttons = Array.from(document.querySelectorAll('button, a')) as HTMLElement[];
+      return buttons.some((b) => {
+        if (!isVisible(b)) return false;
+        const t = (b.textContent ?? '').trim().toLowerCase();
+        return (
+          t === 'sign in' ||
+          t === 'join now' ||
+          t === 'join linkedin' ||
+          t === 'sign in to linkedin'
+        );
+      });
+    });
+
+    logger.info('Session probe DOM signals', { onFeed, positiveDomMatch, negativeDomMatch });
+
+    if (negativeDomMatch) {
+      logger.warn('Session probe: visible Sign in / Join now button found');
+      return false;
+    }
+
+    // Alive if (we're on /feed/ AND no negative signal) OR a positive DOM signal matched
+    return positiveDomMatch || onFeed;
   } catch (err) {
-    logger.error('Session check failed', { err });
+    logger.error('Session check failed', { err: err instanceof Error ? err.message : String(err) });
     return false;
   } finally {
     await context.close();
