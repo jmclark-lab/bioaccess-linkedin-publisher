@@ -225,6 +225,29 @@ async function saveDebugScreenshot(page: Page, label: string): Promise<void> {
 // skipping the "Publish as" dropdown step entirely.
 const JULIO_PROFILE_URN = 'urn:li:fsd_profile:ACoAAAANE8MBRcTFSYWJy3xBByRzEB2dsaCuYOg';
 
+// ── Slug URL validator ────────────────────────────────────────────────────────
+
+/**
+ * Returns true ONLY for real published LinkedIn article slug URLs.
+ *
+ * LinkedIn briefly shows a numeric URN (/pulse/7474474526114942976/) immediately
+ * after clicking Publish. That URL does NOT resolve to a public page — it is a
+ * transient internal reference. The real article URL always contains letters in
+ * the slug portion (e.g. /pulse/from-reform-implementation-...-clark-weete/).
+ *
+ * Accepts:  https://www.linkedin.com/pulse/from-reform-implementation-...-clark-weete/
+ * Rejects:  https://www.linkedin.com/pulse/7474474526114942976/
+ * Rejects:  https://www.linkedin.com/article/edit/7474474526114942976/
+ */
+function isPublishedSlugUrl(url: string): boolean {
+  if (!url.includes('/pulse/')) return false;
+  if (url.includes('/edit')) return false;
+  const match = url.match(/\/pulse\/([^/?#]+)/);
+  if (!match) return false;
+  // A real slug always has at least one letter; numeric-only = transient URN
+  return /[a-zA-Z]/.test(match[1]);
+}
+
 // ── Main publish flow ─────────────────────────────────────────────────────────
 
 export async function publishNewsletter(req: PublishRequest): Promise<PublishResponse> {
@@ -335,8 +358,15 @@ export async function publishNewsletter(req: PublishRequest): Promise<PublishRes
     //   3. LinkedIn stays at /article/edit/<ID>/ (does NOT redirect to /pulse/).
     //      The /pulse/ URL exists as the public reader URL, but the browser stays
     //      at the editor management view.
-    //   4. The published /pulse/ URL can be found as a "View article" link on the
-    //      /article/edit/ page, OR constructed from the article ID.
+    //   4. The real published slug URL (e.g. /pulse/from-reform-...-clark-weete/)
+    //      appears as a "View article" link on the /article/edit/ page AFTER
+    //      LinkedIn has fully processed the publish — this takes up to ~60s.
+    //
+    // ⚠️  KNOWN SILENT FAILURE: LinkedIn temporarily shows a numeric URN URL
+    //     (/pulse/7474474526114942976/) in the address bar immediately after
+    //     clicking Publish. This URL does NOT resolve in a browser and is NOT
+    //     the real article URL. We must poll for a URL containing letters in
+    //     the slug, which signals the real article has been processed.
 
     const PUBLISH_SEL = [
       'button:has-text("Publish")',
@@ -393,86 +423,86 @@ export async function publishNewsletter(req: PublishRequest): Promise<PublishRes
       }
     }
 
-    // ── Step 8: Capture article URL ──────────────────────────────────────────
-    // After publishing, LinkedIn typically stays at /article/edit/<ID>/ and does NOT
-    // redirect to /pulse/. We look for the published URL in order of preference:
-    //   A. We're already at /pulse/ (rare but possible)
-    //   B. There's a "View article" link to /pulse/ on the /article/edit/ page
-    //   C. Navigate via article ID to /article/view/<ID> and follow redirect to /pulse/
-    //   D. Fallback: return the /article/edit/ URL (article IS published, just no redirect)
+    // ── Step 8: Wait for the real published slug URL ─────────────────────────
+    // LinkedIn processes the publish asynchronously. The "View article" link with
+    // the real slug URL may take up to 60s to appear on the /article/edit/ page.
+    // We poll every 5s for up to 90s and ONLY accept URLs with letters in the slug.
+    //
+    // isPublishedSlugUrl() rejects:
+    //   /pulse/7474474526114942976/   ← numeric URN, transient, resolves as 404
+    //   /article/edit/7474474526114942976/  ← editor URL, not a public URL
+    // and accepts:
+    //   /pulse/from-reform-implementation-...-clark-weete/  ← real published URL
 
-    let articleUrl: string;
-    const editUrl = page.url();
-    logger.info('URL after publish', { url: editUrl });
+    const editUrlForPoll = page.url();
+    logger.info('URL after publish click', { url: editUrlForPoll });
     await saveDebugScreenshot(page, `07-post-publish-state-${req.newsletter}`);
 
-    // ── Case A: already at /pulse/ ──
-    if (editUrl.includes('/pulse/') && !editUrl.includes('/edit')) {
-      articleUrl = editUrl;
-      logger.info('Published article URL (direct /pulse/)', { articleUrl });
-    }
+    let articleUrl: string | null = null;
+    const SLUG_POLL_INTERVAL_MS = 5000;
+    const SLUG_POLL_MAX_ATTEMPTS = 18; // 18 × 5s = 90s total
 
-    // ── Case B or C: at /article/edit/<ID>/ ──
-    else if (/\/article\/edit\/\d+/.test(editUrl) || editUrl.includes('/article/')) {
-      // B: scan page for a visible /pulse/ link (LinkedIn "View article" button)
-      const pulseLink = await page.evaluate((): string | null => {
+    for (let attempt = 0; attempt < SLUG_POLL_MAX_ATTEMPTS && !articleUrl; attempt++) {
+      if (attempt > 0) {
+        await humanDelay(SLUG_POLL_INTERVAL_MS);
+      }
+
+      const currentUrl = page.url();
+      logger.info(`Slug poll attempt ${attempt + 1}/${SLUG_POLL_MAX_ATTEMPTS}`, { url: currentUrl });
+
+      // ── Check 1: page URL is already a real slug ──
+      if (isPublishedSlugUrl(currentUrl)) {
+        articleUrl = currentUrl;
+        logger.info('Slug URL found in page URL', { articleUrl });
+        break;
+      }
+
+      // ── Check 2: scan all links for a "View article" slug URL ──
+      const candidateLink = await page.evaluate((): string | null => {
         const links = Array.from(document.querySelectorAll('a[href*="/pulse/"]'));
         for (const a of links) {
           const href = a.getAttribute('href') ?? '';
-          if (!href.includes('/edit')) {
-            return href.startsWith('http') ? href : `https://www.linkedin.com${href}`;
-          }
+          if (href.includes('/edit')) continue;
+          const match = href.match(/\/pulse\/([^/?#]+)/);
+          if (!match) continue;
+          // Skip numeric-only URNs — must have at least one letter
+          if (!/[a-zA-Z]/.test(match[1])) continue;
+          return href.startsWith('http') ? href : `https://www.linkedin.com${href}`;
         }
         return null;
       });
 
-      if (pulseLink) {
-        articleUrl = pulseLink;
-        logger.info('Published article URL (via /pulse/ link on page)', { articleUrl });
-      } else {
-        // C: try navigating via article ID → may redirect to /pulse/
-        const articleId = editUrl.match(/\/article\/edit\/(\d+)/)?.[1];
-        if (articleId) {
-          logger.info('Trying /article/view/ redirect to find /pulse/ URL', { articleId });
-          try {
-            await page.goto(
-              `https://www.linkedin.com/pulse/${articleId}/`,
-              { waitUntil: 'domcontentloaded', timeout: 15_000 },
-            );
-            await humanDelay(2000);
-            const redirected = page.url();
-            if (redirected.includes('/pulse/') && !redirected.includes('/edit')) {
-              articleUrl = redirected;
-              logger.info('Published article URL (via /pulse/ redirect)', { articleUrl });
-            } else {
-              // D: fallback — use edit URL (article IS published)
-              articleUrl = editUrl;
-              logger.info('Published article URL (edit URL fallback)', { articleUrl });
-            }
-          } catch {
-            articleUrl = editUrl;
-            logger.info('Published article URL (edit URL fallback, navigation failed)', { articleUrl });
-          }
-        } else {
-          // D: no article ID parseable — use whatever URL we have
-          articleUrl = editUrl;
-          logger.info('Published article URL (fallback, no article ID)', { articleUrl });
-        }
+      if (candidateLink) {
+        articleUrl = candidateLink;
+        logger.info('Slug URL found in page link', { articleUrl });
+        break;
       }
+
+      // ── After 30s: reload the edit page to refresh "View article" button ──
+      if (attempt === 5 && /\/article\/edit\/\d+/.test(currentUrl)) {
+        logger.info('Reloading edit page to refresh View article link');
+        await page.reload({ waitUntil: 'domcontentloaded', timeout: 20_000 }).catch(() => {});
+      }
+
+      await saveDebugScreenshot(page, `07-slug-poll-${attempt + 1}-${req.newsletter}`);
     }
 
-    // ── Unexpected URL ──
-    else {
+    if (!articleUrl) {
+      const lastUrl = page.url();
+      await saveDebugScreenshot(page, `07-slug-timeout-${req.newsletter}`);
+      logger.error('Timed out waiting for slug URL', { lastUrl });
       throw new Error(
-        `Publish flow ended at unexpected URL: ${editUrl}. ` +
-          'Check debug screenshots (05-*, 06-*, 07-*).',
+        `Publish flow never resolved to a real article URL after 90s. ` +
+        `Last URL: ${lastUrl}. The article may not have published, or the ` +
+        `LinkedIn session expired during the flow. ` +
+        `Check debug screenshots (07-slug-poll-*, 07-slug-timeout-*).`,
       );
     }
 
     logger.info('Article published successfully', { articleUrl });
     await saveDebugScreenshot(page, `09-published-${req.newsletter}`);
 
-    // ── Step 8: Save updated session cookies ──────────────────────────────────
+    // ── Step 9: Save updated session cookies ──────────────────────────────────
     await context.storageState({ path: config.sessionFile });
     logger.info('Session cookies refreshed');
 

@@ -2,14 +2,25 @@ import express, { Request, Response, NextFunction } from 'express';
 import { config } from './config.js';
 import { logger } from './logger.js';
 import { authMiddleware } from './middleware.js';
-import { closeBrowser, publishNewsletter } from './linkedin.js';
+import { closeBrowser, publishNewsletter, checkSessionAlive } from './linkedin.js';
 import { sessionFileExists, sessionAgeHours, writeStorageState, normaliseToStorageState } from './session.js';
 import { notifySuccess, notifyFailure } from './webhook.js';
-import type { PublishRequest, HealthResponse, UpdateSessionRequest } from './types.js';
+import type { PublishRequest, HealthResponse, UpdateSessionRequest, NewsletterKey } from './types.js';
 
 // ── Mutex for serialising publish calls ────────────────────────────────────────
 // LinkedIn's browser session can't handle concurrent publishes safely.
 let publishInFlight = false;
+
+// ── In-memory publish history (last 20 attempts) ──────────────────────────────
+interface PublishRecord {
+  at: string;           // ISO timestamp
+  newsletter: string;
+  title: string;
+  success: boolean;
+  article_url?: string;
+  error?: string;
+}
+const publishHistory: PublishRecord[] = [];
 
 // ── App ────────────────────────────────────────────────────────────────────────
 
@@ -78,6 +89,30 @@ app.post(
       return;
     }
 
+    // ── Session alive pre-check ────────────────────────────────────────────────
+    // Verify the LinkedIn session is still valid before attempting to publish.
+    // A dead session would cause the publish to fail silently (LinkedIn redirects
+    // to the article editor without auth, Playwright sees no login wall, but the
+    // Publish click silently does nothing). We gate here to return a clear error.
+    logger.info('Checking LinkedIn session before publish');
+    const sessionAlive = await checkSessionAlive().catch((err) => {
+      logger.warn('Session alive check threw — proceeding anyway', { err: String(err) });
+      return true; // don't block on a check error
+    });
+    if (!sessionAlive) {
+      logger.warn('LinkedIn session is dead — rejecting publish request');
+      const deadSessionResult = {
+        success: false,
+        error: 'LinkedIn session has expired. POST /admin/update-session with fresh cookies before publishing.',
+        error_code: 'SESSION_EXPIRED',
+      };
+      await notifyFailure(newsletter as NewsletterKey, title!, deadSessionResult.error);
+      publishHistory.unshift({ at: new Date().toISOString(), newsletter: newsletter!, title: title!, success: false, error: deadSessionResult.error });
+      if (publishHistory.length > 20) publishHistory.pop();
+      res.status(503).json(deadSessionResult);
+      return;
+    }
+
     publishInFlight = true;
     logger.info('Publish request received', { newsletter, title });
 
@@ -89,18 +124,31 @@ app.post(
         cover_image_url,
       });
 
+      // Record in publish history
+      publishHistory.unshift({
+        at: new Date().toISOString(),
+        newsletter: newsletter!,
+        title: title!,
+        success: result.success,
+        article_url: result.article_url,
+        error: result.error,
+      });
+      if (publishHistory.length > 20) publishHistory.pop();
+
       if (result.success && result.article_url) {
-        await notifySuccess(newsletter, title, result.article_url);
+        await notifySuccess(newsletter as NewsletterKey, title!, result.article_url);
         res.status(200).json(result);
       } else {
-        await notifyFailure(newsletter, title, result.error ?? 'Unknown error');
+        await notifyFailure(newsletter as NewsletterKey, title!, result.error ?? 'Unknown error');
         const statusCode = result.error_code === 'SESSION_EXPIRED' ? 503 : 500;
         res.status(statusCode).json(result);
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       logger.error('Unhandled publish error', { err: message });
-      await notifyFailure(newsletter, title, message);
+      publishHistory.unshift({ at: new Date().toISOString(), newsletter: newsletter!, title: title!, success: false, error: message });
+      if (publishHistory.length > 20) publishHistory.pop();
+      await notifyFailure(newsletter as NewsletterKey, title!, message);
       res.status(500).json({ success: false, error: message, error_code: 'INTERNAL_ERROR' });
     } finally {
       publishInFlight = false;
@@ -148,6 +196,13 @@ app.post(
     }
   },
 );
+
+// ── Publish history — authenticated ──────────────────────────────────────────
+
+app.get('/admin/last-runs', authMiddleware, (req: Request, res: Response): void => {
+  const n = Math.min(parseInt((req.query['n'] as string) ?? '10', 10), 20);
+  res.status(200).json({ runs: publishHistory.slice(0, n), total: publishHistory.length });
+});
 
 // ── 404 ───────────────────────────────────────────────────────────────────────
 
