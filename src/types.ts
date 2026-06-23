@@ -40,9 +40,19 @@ export interface PublishResponse {
 export interface HealthResponse {
   status: 'ok' | 'degraded' | 'error';
   session_alive: boolean;
+  session_alive_checked_at?: string;
+  session_alive_cache_age_seconds?: number;
+  session_alive_freshly_checked?: boolean;
   session_file_exists: boolean;
   session_age_hours?: number;
+  session_will_expire_soon?: boolean;
   last_checked: string;
+  last_publish?: {
+    at: string;
+    newsletter: string;
+    success: boolean;
+    article_url?: string;
+  };
   message?: string;
 }
 

@@ -22,6 +22,71 @@ interface PublishRecord {
 }
 const publishHistory: PublishRecord[] = [];
 
+// ── Cached session-alive probe ────────────────────────────────────────────────
+// checkSessionAlive() launches a Playwright context and navigates to LinkedIn.
+// That's expensive (~3–8s) and we do NOT want Railway's frequent liveness
+// healthchecks to trigger it on every hit. Consumers that need a real session
+// check pass `?check_session=true` to /health, which refreshes the cache.
+// Other consumers (and Railway's own healthcheck) see the most-recent cached
+// value, or false if nothing has been probed yet.
+const SESSION_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+interface SessionCheckCache {
+  alive: boolean;
+  checkedAt: string; // ISO
+}
+let sessionCheckCache: SessionCheckCache | null = null;
+
+/** Returns cache age in seconds, or undefined if no cache. */
+function sessionCacheAgeSeconds(): number | undefined {
+  if (!sessionCheckCache) return undefined;
+  return Math.round((Date.now() - new Date(sessionCheckCache.checkedAt).getTime()) / 1000);
+}
+
+/**
+ * Returns the current session-alive status.
+ * - If forceFresh=true OR cache is missing/stale: launches a browser probe and
+ *   refreshes the cache.
+ * - Otherwise returns the cached value.
+ */
+async function getSessionAliveWithCache(forceFresh: boolean): Promise<{
+  alive: boolean;
+  checkedAt: string;
+  freshlyChecked: boolean;
+}> {
+  const cacheValid =
+    sessionCheckCache !== null &&
+    Date.now() - new Date(sessionCheckCache.checkedAt).getTime() < SESSION_CACHE_TTL_MS;
+
+  if (!forceFresh && cacheValid && sessionCheckCache) {
+    return {
+      alive: sessionCheckCache.alive,
+      checkedAt: sessionCheckCache.checkedAt,
+      freshlyChecked: false,
+    };
+  }
+
+  if (!sessionFileExists()) {
+    const now = new Date().toISOString();
+    sessionCheckCache = { alive: false, checkedAt: now };
+    return { alive: false, checkedAt: now, freshlyChecked: true };
+  }
+
+  try {
+    const alive = await checkSessionAlive();
+    const now = new Date().toISOString();
+    sessionCheckCache = { alive, checkedAt: now };
+    return { alive, checkedAt: now, freshlyChecked: true };
+  } catch (err) {
+    logger.warn('Session-alive probe threw — caching as dead', { err: String(err) });
+    const now = new Date().toISOString();
+    sessionCheckCache = { alive: false, checkedAt: now };
+    return { alive: false, checkedAt: now, freshlyChecked: true };
+  }
+}
+
+/** Threshold (hours) beyond which we warn that session will expire soon. */
+const SESSION_EXPIRY_WARNING_HOURS = 72;
+
 // ── App ────────────────────────────────────────────────────────────────────────
 
 const app = express();
@@ -32,17 +97,57 @@ app.use(express.json({ limit: '10mb' }));
 // instantly so Railway's healthcheck passes regardless of session state.
 // Session validity is checked implicitly on the first publish request.
 
-app.get('/health', (_req: Request, res: Response) => {
+app.get('/health', async (req: Request, res: Response) => {
   const fileExists = sessionFileExists();
+  const ageHours = fileExists ? Math.round(sessionAgeHours() * 10) / 10 : undefined;
+  const checkSession = req.query['check_session'] === 'true' || req.query['check_session'] === '1';
+
+  // Only probe LinkedIn if (a) consumer explicitly asked, OR (b) we have a stale/missing cache.
+  // Railway's default liveness check (no query param) sees only the cached value.
+  let aliveResult: { alive: boolean; checkedAt: string; freshlyChecked: boolean };
+  if (checkSession) {
+    aliveResult = await getSessionAliveWithCache(true);
+  } else if (sessionCheckCache) {
+    aliveResult = {
+      alive: sessionCheckCache.alive,
+      checkedAt: sessionCheckCache.checkedAt,
+      freshlyChecked: false,
+    };
+  } else {
+    // No cache yet and consumer did not ask for a fresh check — report unknown (false)
+    aliveResult = { alive: false, checkedAt: new Date().toISOString(), freshlyChecked: false };
+  }
+
+  const willExpireSoon =
+    ageHours !== undefined && ageHours > SESSION_EXPIRY_WARNING_HOURS;
+
+  const lastPublishRecord = publishHistory[0];
+
   const body: HealthResponse = {
     status: 'ok',
-    session_alive: false, // not checked here — requires browser
+    session_alive: aliveResult.alive,
+    session_alive_checked_at: aliveResult.checkedAt,
+    session_alive_cache_age_seconds: sessionCacheAgeSeconds(),
+    session_alive_freshly_checked: aliveResult.freshlyChecked,
     session_file_exists: fileExists,
-    session_age_hours: fileExists ? Math.round(sessionAgeHours() * 10) / 10 : undefined,
+    session_age_hours: ageHours,
+    session_will_expire_soon: willExpireSoon,
     last_checked: new Date().toISOString(),
-    message: fileExists
-      ? undefined
-      : 'Session file not found — POST /admin/update-session to initialise',
+    last_publish: lastPublishRecord
+      ? {
+          at: lastPublishRecord.at,
+          newsletter: lastPublishRecord.newsletter,
+          success: lastPublishRecord.success,
+          article_url: lastPublishRecord.article_url,
+        }
+      : undefined,
+    message: !fileExists
+      ? 'Session file not found — POST /admin/update-session to initialise'
+      : !aliveResult.alive && aliveResult.freshlyChecked
+        ? 'LinkedIn session is dead. POST /admin/update-session with fresh cookies.'
+        : willExpireSoon
+          ? `Session is ${ageHours}h old. Refresh cookies soon to avoid expiration.`
+          : undefined,
   };
   res.status(200).json(body); // always 200 — this is a liveness check, not a session check
 });
@@ -99,6 +204,8 @@ app.post(
       logger.warn('Session alive check threw — proceeding anyway', { err: String(err) });
       return true; // don't block on a check error
     });
+    // Refresh the /health cache while we're at it (free, since we just probed)
+    sessionCheckCache = { alive: sessionAlive, checkedAt: new Date().toISOString() };
     if (!sessionAlive) {
       logger.warn('LinkedIn session is dead — rejecting publish request');
       const deadSessionResult = {
