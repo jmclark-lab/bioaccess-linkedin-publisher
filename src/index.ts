@@ -199,18 +199,30 @@ app.post(
     // A dead session would cause the publish to fail silently (LinkedIn redirects
     // to the article editor without auth, Playwright sees no login wall, but the
     // Publish click silently does nothing). We gate here to return a clear error.
-    logger.info('Checking LinkedIn session before publish');
-    const sessionAlive = await checkSessionAlive().catch((err) => {
-      logger.warn('Session alive check threw — proceeding anyway', { err: String(err) });
-      return true; // don't block on a check error
-    });
+    const skipSessionCheck =
+      req.query['skip_session_check'] === 'true' ||
+      req.query['skip_session_check'] === '1' ||
+      (req.body as { skip_session_check?: boolean })?.skip_session_check === true;
+
+    let sessionAlive = true;
+    if (skipSessionCheck) {
+      logger.info('Skipping pre-publish session check (caller opt-out via skip_session_check)');
+    } else {
+      logger.info('Checking LinkedIn session before publish');
+      sessionAlive = await checkSessionAlive().catch((err) => {
+        logger.warn('Session alive check threw — proceeding anyway', { err: String(err) });
+        return true; // don't block on a check error
+      });
+    }
     // Refresh the /health cache while we're at it (free, since we just probed)
-    sessionCheckCache = { alive: sessionAlive, checkedAt: new Date().toISOString() };
+    if (!skipSessionCheck) {
+      sessionCheckCache = { alive: sessionAlive, checkedAt: new Date().toISOString() };
+    }
     if (!sessionAlive) {
       logger.warn('LinkedIn session is dead — rejecting publish request');
       const deadSessionResult = {
         success: false,
-        error: 'LinkedIn session has expired. POST /admin/update-session with fresh cookies before publishing.',
+        error: 'LinkedIn session has expired. POST /admin/update-session with fresh cookies before publishing. (To bypass this gate, pass ?skip_session_check=true.)',
         error_code: 'SESSION_EXPIRED',
       };
       await notifyFailure(newsletter as NewsletterKey, title!, deadSessionResult.error);
